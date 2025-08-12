@@ -1,3 +1,4 @@
+# TODO: Improve mask geometry to account for ego yaw and sight range.
 import numpy as np
 from .base_handler import BaseHandler
 

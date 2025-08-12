@@ -336,37 +336,26 @@ class LatentActor(nj.Module):
         self._stoch_size = stoch_size
         self._classes = classes
         self._kw = kw
-        if self._classes:
-            self._shape = (self._deter_size + self._stoch_size * self._classes,)
-        else:
-            self._shape = (self._deter_size + self._stoch_size,)
-
         self._mlp = MLP(
-            shape=self._shape,
-            layers=mlp_layers,
-            units=mlp_units,
-            name="la_mlp",
-            **self._kw
+            shape=None, layers=mlp_layers, units=mlp_units, name="la_mlp", **self._kw
         )
+        out_dim = self._deter_size + self._stoch_size * (self._classes or 1)
+        self._out = Linear(out_dim, **{k: v for k, v in self._kw.items() if k != "name"})
 
     def __call__(self, h, z, a):
         if self._classes:
             z = z.reshape(z.shape[:-2] + (self._stoch_size * self._classes,))
-        
         if len(a.shape) > len(h.shape):
-            shape = a.shape[:-2] + (np.prod(a.shape[-2:]),)
-            a = a.reshape(shape)
-
+            a = a.reshape(a.shape[:-2] + (int(np.prod(a.shape[-2:])),))
         x = jnp.concatenate([h, z, a], -1)
         x = self._mlp(x)
-        
+        x = self._out(x)
+        h_hat, z_flat = jnp.split(x, [self._deter_size], -1)
         if self._classes:
-            h_hat, z_hat_logit = jnp.split(x, [self._deter_size], -1)
-            z_hat = z_hat_logit.reshape(z_hat_logit.shape[:-1] + (self._stoch_size, self._classes))
-            return h_hat, z_hat
+            z_hat = z_flat.reshape(z_flat.shape[:-1] + (self._stoch_size, self._classes))
         else:
-            h_hat, z_hat = jnp.split(x, [self._deter_size], -1)
-            return h_hat, z_hat
+            z_hat = z_flat
+        return h_hat, z_hat
 
 class ReconstructionActor(nj.Module):
     def __init__(self, shape, cnn_depth=48, cnn_blocks=2, resize='stride', minres=4, cnn_sigmoid=False, image_dist='mse', **kw):
