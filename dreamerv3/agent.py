@@ -47,7 +47,7 @@ class Agent(nj.Module):
                 if rk:
                     o_hat = jnp.zeros((batch_size, *self.obs_space[rk].shape))
                     arkangel_pred['o_hat'] = o_hat
-        
+
         return (
             (wm_initial, prev_action, arkangel_pred, jnp.zeros(batch_size, dtype=jnp.int32)),
             self.task_behavior.initial(batch_size),
@@ -62,20 +62,14 @@ class Agent(nj.Module):
         obs = self.preprocess(obs)
         (prev_latent, prev_action, prev_arkangel_pred, blackout_counter), task_state, expl_state = state
 
+        # Compute per-sample blackout from mask_fov if present
         if 'mask_fov' in obs:
             coverage = obs['mask_fov'].mean(axis=tuple(range(1, obs['mask_fov'].ndim)))
             is_blackout = coverage <= 1e-6
         else:
             is_blackout = jnp.zeros(prev_latent['deter'].shape[:1], dtype=bool)
 
-        use_prediction = (
-            self.config.arkangel.enable
-            and (self.config.arkangel.patch in ('pixel','latent'))
-            and (mode != 'train')
-            and (blackout_counter < self.config.arkangel.patch_k)
-            and is_blackout
-        )
-
+        # Optionally patch pixels BEFORE encoding (pixel patch)
         if (
             self.config.arkangel.enable
             and self.config.arkangel.patch == 'pixel'
@@ -89,41 +83,43 @@ class Agent(nj.Module):
                 o_hat = prev_arkangel_pred['o_hat'].astype(obs[rk].dtype)
                 obs[rk] = mask * obs[rk] + (1 - mask) * o_hat
 
-        if use_prediction.any():
-            blackout_counter = jnp.where(use_prediction, blackout_counter + 1, jnp.zeros_like(blackout_counter))
+        # Encode and update posterior once
+        embed = self.wm.encoder(obs)
+        post_latent, _ = self.wm.rssm.obs_step(prev_latent, prev_action, embed, obs["is_first"])
+        latent = {'deter': post_latent['deter'], 'stoch': post_latent['stoch']}
+
+        # Decide if we should use predicted latents (latent patch)
+        use_pred = (
+            self.config.arkangel.enable
+            and (self.config.arkangel.patch == 'latent')
+            and (mode != 'train')
+            and ('h_hat' in prev_arkangel_pred)
+        )
+        if use_pred and 'mask_fov' in obs:
+            cov = obs['mask_fov'].mean(axis=tuple(range(1, obs['mask_fov'].ndim)))
+            use_prediction = (cov <= self.config.arkangel.gate.min_coverage) & (blackout_counter < self.config.arkangel.patch_k)
+        else:
+            use_prediction = jnp.zeros_like(is_blackout, dtype=bool)
+
+        # Update blackout counter per-sample
+        blackout_counter = jnp.where(use_prediction, blackout_counter + 1, jnp.zeros_like(blackout_counter))
+
+        # Per-sample blend of predicted vs posterior latents (no Python branching on JAX arrays)
+        if use_pred:
             h_pred = prev_arkangel_pred['h_hat']
             z_pred = prev_arkangel_pred['z_hat']
             if self.wm.rssm._classes:
                 z_mode = jnp.argmax(z_pred, axis=-1)
-                z_onehot = jax.nn.one_hot(z_mode, self.wm.rssm._classes, dtype=h_pred.dtype)
-                stoch_pred = z_onehot
+                z_pred = jax.nn.one_hot(z_mode, self.wm.rssm._classes, dtype=latent['deter'].dtype)
+                mask_stoch = use_prediction[..., None, None]
             else:
-                stoch_pred = z_pred
-            latent = {'deter': h_pred, 'stoch': stoch_pred}
-        else:
-            blackout_counter = jnp.zeros_like(blackout_counter)
-            embed = self.wm.encoder(obs)
-            latent, _ = self.wm.rssm.obs_step(prev_latent, prev_action, embed, obs["is_first"])
+                mask_stoch = use_prediction[..., None]
 
-            if (
-                self.config.arkangel.enable
-                and self.config.arkangel.patch == 'latent'
-                and mode != 'train'
-                and 'mask_fov' in obs
-                and 'h_hat' in prev_arkangel_pred
-            ):
-                h_hat, z_hat = prev_arkangel_pred['h_hat'], prev_arkangel_pred['z_hat']
-                cov = obs['mask_fov'].mean(axis=tuple(range(1, obs['mask_fov'].ndim)))
-                m_t = (cov > self.config.arkangel.gate.min_coverage).astype(jnp.float32)
-                m = m_t[..., None]
-                latent['deter'] = m * latent['deter'] + (1 - m) * h_hat
-                if self.wm.rssm._classes:
-                    z_mode = jnp.argmax(z_hat, axis=-1)
-                    z_hat_use = jax.nn.one_hot(z_mode, self.wm.rssm._classes, dtype=latent['deter'].dtype)
-                else:
-                    z_hat_use = z_hat
-                latent['stoch'] = m[..., None] * latent['stoch'] + (1 - m[..., None]) * z_hat_use
+            mask_deter = use_prediction[..., None]
+            latent['deter'] = jnp.where(mask_deter, h_pred, latent['deter'])
+            latent['stoch'] = jnp.where(mask_stoch, z_pred, latent['stoch'])
 
+        # Action selection
         task_outs, task_state = self.task_behavior.policy(latent, task_state)
         expl_outs, expl_state = self.expl_behavior.policy(latent, expl_state)
         if mode == "eval":
@@ -139,6 +135,7 @@ class Agent(nj.Module):
             outs["log_entropy"] = outs["action"].entropy()
             outs["action"] = outs["action"].sample(seed=nj.rng())
 
+        # Predict next-step latent (and optional reconstruction) for ArkAngel
         arkangel_pred = {}
         if self.config.arkangel.enable:
             h_hat_tp1, z_hat_tp1 = self.wm.la_head(latent['deter'], latent['stoch'], outs['action'])
@@ -172,7 +169,6 @@ class Agent(nj.Module):
                 "model_loss": metrics["model_loss_raw"].copy(),
                 "td_error": metrics["td_error"].copy(),
             }
-
         else:
             outs = {}
 
@@ -280,7 +276,7 @@ class WorldModel(nj.Module):
             loss = -dist.log_prob(data[key].astype(jnp.float32))
             assert loss.shape == embed.shape[:2], (key, loss.shape)
             losses[key] = loss
-        
+
         if self.config.arkangel.enable:
             h_t = post['deter'][:, :-1]
             z_t = post['stoch'][:, :-1]
@@ -289,7 +285,7 @@ class WorldModel(nj.Module):
 
             h_tp1_target = sg(post['deter'][:, 1:])
             la_loss_h = ((h_hat_tp1 - h_tp1_target) ** 2).mean()
-            
+
             if self.rssm._classes:
                 q_logits_tp1 = sg(post['logit'][:, 1:])
                 p_logits_tp1 = z_hat_tp1
