@@ -100,7 +100,7 @@ class RSSM(nj.Module):
         else:
             mean = state["mean"].astype(f32)
             std = state["std"].astype(f32)
-            return tfp.MultivariateNormalDiag(mean, std)
+            return tfd.MultivariateNormalDiag(mean, std)
 
     def obs_step(self, prev_state, prev_action, embed, is_first):
         is_first = cast(is_first)
@@ -392,7 +392,6 @@ class ImageEncoderResnet(nj.Module):
         stages = int(np.log2(x.shape[-2]) - np.log2(self._minres))
         depth = self._depth
         x = jaxutils.cast_to_compute(x) - 0.5
-        # print(x.shape)
         for i in range(stages):
             kw = {**self._kw, "preact": False}
             if self._resize == "stride":
@@ -416,12 +415,10 @@ class ImageEncoderResnet(nj.Module):
                 x = self.get(f"s{i}b{j}conv1", Conv2D, depth, 3, **kw)(x)
                 x = self.get(f"s{i}b{j}conv2", Conv2D, depth, 3, **kw)(x)
                 x += skip
-                # print(x.shape)
             depth *= 2
         if self._blocks:
             x = get_act(self._kw["act"])(x)
         x = x.reshape((x.shape[0], -1))
-        # print(x.shape)
         return x
 
 
@@ -447,7 +444,6 @@ class ImageDecoderResnet(nj.Module):
                 x = self.get(f"s{i}b{j}conv1", Conv2D, depth, 3, **kw)(x)
                 x = self.get(f"s{i}b{j}conv2", Conv2D, depth, 3, **kw)(x)
                 x += skip
-                # print(x.shape)
             depth //= 2
             kw = {**self._kw, "preact": False}
             if i == stages - 1:
@@ -469,7 +465,6 @@ class ImageDecoderResnet(nj.Module):
             padw = (x.shape[2] - self._shape[1]) / 2
             x = x[:, int(np.ceil(padh)) : -int(padh), :]
             x = x[:, :, int(np.ceil(padw)) : -int(padw)]
-        # print(x.shape)
         assert x.shape[-3:] == self._shape, (x.shape, self._shape)
         if self._sigmoid:
             x = jax.nn.sigmoid(x)
