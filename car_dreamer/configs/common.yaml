@@ -157,6 +157,13 @@ env:
       error_rate: 0.2
       entities: [roadmap, waypoints, error_background_waypoints, ego_vehicle, background_vehicles]
 
+    mask_fov:
+      handler: mask
+      key: mask_fov
+      shape: [128, 128, 1]
+      sight_fov: 150
+      ego_offset: 116
+
   display:
     enable: True
     render_keys: [camera, birdeye_wpt]

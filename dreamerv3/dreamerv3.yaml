@@ -291,3 +291,20 @@ xlarge:
   .*\.cnn_depth: 96
   .*\.units: 1024
   .*\.layers: 5
+
+arkangel:
+  enable: false
+  lambda_la: 1.0
+  lambda_ra: 0.5
+  lpips_weight: 0.5
+  patch: 'none'
+  patch_k: 0
+  gate:
+    min_coverage: 0.6
+  la_head:
+    mlp_layers: 4
+    mlp_units: 512
+  ra_head:
+    cnn_depth: 48
+    cnn_blocks: 2
+    recon_key: 'birdeye_raw'

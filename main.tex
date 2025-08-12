@@ -1,0 +1,198 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ArkAngel x DreamerV3: Future-Aware Auxiliary Heads with FOV Patching
+% Clean notation, full flow, objectives, and CarDreamer test protocol
+% Compile with: pdflatex
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsfonts,booktabs,graphicx}
+\usepackage[margin=1in]{geometry}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue]{hyperref}
+\usepackage{bm}
+\usepackage{array}
+\newcommand{\sg}{\operatorname{stop\_grad}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\setlength{\parskip}{0.6em}
+\setlength{\parindent}{0pt}
+
+\begin{document}
+
+{\LARGE \textbf{ArkAngel for Dreamer\,V3: Test Plan}}\\[0.5em]
+
+\hrule
+
+\section*{1.\quad Symbols, Networks, and Intended Semantics}
+
+The agent interacts with an environment that emits image observations $o_t\in\mathbb{R}^{3\times H\times W}$, rewards $r_t\in\mathbb{R}$, and termination discounts $\gamma_t\in\{0,1\}$. Dreamer\,V3 factorizes perception and dynamics via an encoder $\phi$, a recurrent state--space model (RSSM) with deterministic hidden state $h_t$ and discrete stochastic latent $z_t$, decoder heads for pixels/rewards/discounts, and an actor--critic that conditions on the latent state. ArkAngel adds two future--aware auxiliary heads that operate only on real (observation) steps and remain inactive during imagination.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}L{2.6cm} L{10.7cm} L{2.7cm}@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} & \textbf{Produced by} \\
+\midrule
+$o_t$ & RGB image at time $t$ & environment \\
+$e_t=\phi(o_t)$ & image embedding (``encode'') & encoder CNN $\phi$ \\
+$h_t$ & deterministic belief (RNN/GRU hidden; carries memory) & RSSM core $f$ \\
+$z_t$ & discrete stochastic latent code (categorical) & posterior $q(z_t\!\mid h_t,e_t)$ or prior $p(z_t\!\mid h_t)$ \\
+$s_t\equiv(h_t,z_t)$ & full latent state used by decoders and policy & composition \\
+$a_t$ & action sampled from the policy & actor $\pi_\theta(a\!\mid h_t,z_t)$ \\
+$\hat o_t,\hat r_t,\hat\gamma_t$ & reconstructions of pixels, reward, discount & decoders $d_o,d_r,d_\gamma$ \\
+$\hat h_{t+1}^{\mathrm{LA}},\hat z_{t+1}^{\mathrm{LA}}$ & \textbf{predicted next belief/latent} (future one--step) & \textbf{ArkAngel latent actor $g_{\mathrm{LA}}$} \\
+$\hat o_{t+1}^{\mathrm{RA}}$ & \textbf{predicted next pixels} (future one--step) & \textbf{ArkAngel recon actor $g_{\mathrm{RA}}$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The encoder $\phi$ is a convolutional network; the core $f$ is a deterministic RNN/GRU that updates $h_{t+1}$ from $(h_t,z_t,a_t)$; the stochastic latent $z_t$ is amortized by the posterior $q(z_t|h_t,e_t)$ during observation and by the prior $p(z_{t+1}|h_{t+1})$ during imagination; the decoders $d_o,d_r,d_\gamma$ are a deconvolutional image head and two MLP scalar heads; the policy $\pi_\theta$ and value $V_\theta$ are MLPs on $(h,z)$. ArkAngel heads $g_{\mathrm{LA}}$ and $g_{\mathrm{RA}}$ are lightweight MLP/UNet modules introduced below.
+
+\section*{2.\quad Real (Observation) Step: Exact Computation and Objectives}
+
+On real steps the encoder is active, the posterior is used for $z_t$, and all reconstruction losses apply. The computation order matches Dreamer\,V3 exactly.
+
+\textbf{Perception and posterior inference.}
+\begin{align}
+e_t &= \phi(o_t), \label{eq:enc} \\
+h_t &= f(h_{t-1}, z_{t-1}, a_{t-1}), \label{eq:core} \\
+z_t &\sim q_\theta\!\left(z_t \mid h_t, e_t\right). \label{eq:post}
+\end{align}
+
+\textbf{Reconstruction heads.}
+\begin{align}
+\hat o_t = d_o(h_t,z_t), \qquad \hat r_t = d_r(h_t,z_t), \qquad \hat\gamma_t = d_\gamma(h_t,z_t). \label{eq:decs}
+\end{align}
+
+\textbf{ArkAngel latent actor (LA): dynamics--aligned one--step prediction.}
+\begin{align}
+\left[\hat h_{t+1}^{\mathrm{LA}}, \hat z_{t+1}^{\mathrm{LA}}\right] &= g_{\mathrm{LA}}\!\left(\,[h_t, z_t, a_t]\,\right), \label{eq:la_pred}\\
+L_{\mathrm{LA}} &= \left\| \sg(h_{t+1}) - \hat h_{t+1}^{\mathrm{LA}} \right\|_2^2 \;+\; \left\| \sg(z_{t+1}) - \hat z_{t+1}^{\mathrm{LA}} \right\|_2^2. \label{eq:la_loss}
+\end{align}
+The target state $(h_{t+1},z_{t+1})$ is the \emph{next} posterior draw and gradients are stopped to avoid perturbing the ELBO through this auxiliary path. Conditioning on $[h_t,z_t,a_t]$ mirrors the Markov kernel used by the RSSM, thereby aligning LA with the transition that will be used in imagination.
+
+\textbf{ArkAngel reconstruction actor (RA): future pixels from future belief.}
+\begin{align}
+\hat o_{t+1}^{\mathrm{RA}} &= g_{\mathrm{RA}}\!\left(\hat h_{t+1}^{\mathrm{LA}}, \hat z_{t+1}^{\mathrm{LA}}\right), \label{eq:ra_pred}\\
+L_{\mathrm{RA}} &= \left\| o_{t+1} - \hat o_{t+1}^{\mathrm{RA}} \right\|_2^2 \;+\; \beta_{\mathrm{LPIPS}}\,\mathrm{LPIPS}\!\left(o_{t+1}, \hat o_{t+1}^{\mathrm{RA}}\right). \label{eq:ra_loss}
+\end{align}
+By decoding from the predicted \emph{future} state rather than from $(h_t,z_t)$, RA enforces appearance sufficiency that is constrained by dynamics, rather than exploiting present--frame idiosyncrasies.
+
+\textbf{World--model ELBO term (unchanged).}
+\begin{align}
+L_{\mathrm{wm}} \;=\; \|o_t-\hat o_t\|_2^2 \;+\; \|r_t-\hat r_t\|_2^2 \;+\; \|\gamma_t-\hat\gamma_t\|_2^2 \;+\; \beta\, D_{\mathrm{KL}}\!\left(q_\theta(z_t\!\mid h_t,e_t)\,\big\|\,p_\theta(z_t\!\mid h_t)\right). \label{eq:wm}
+\end{align}
+
+\textbf{Total observation objective.}
+\begin{align}
+\boxed{\,L_{\mathrm{Phase1}} \;=\; L_{\mathrm{wm}} \;+\; \lambda_{\mathrm{LA}}\,L_{\mathrm{LA}} \;+\; \lambda_{\mathrm{RA}}\,L_{\mathrm{RA}}.\,} \label{eq:phase1}
+\end{align}
+In practice $\lambda_{\mathrm{LA}}$ is fixed (e.g.\ $1.0$) while $\lambda_{\mathrm{RA}}$ is annealed from $0$ to its target over the initial optimization window to prevent destabilizing the early ELBO.
+
+\section*{3.\quad Dream (Imagination) Rollout: Encoder--Free Latent Simulation}
+
+Imagination proceeds without images and without the encoder. The actor proposes actions from the current latent, the core advances $h$, the prior samples $z$, and scalar decoders produce rewards and discounts for policy evaluation. The pixel decoder is typically disabled for efficiency.
+
+\textbf{Per imagined step $h\!\to\!h{+}1$:}
+\begin{align}
+\bar a_h &\sim \pi_\theta(\cdot \mid \bar h_h, \bar z_h), \label{eq:actor}\\
+\bar h_{h+1} &= f(\bar h_h, \bar z_h, \bar a_h), \label{eq:core_dream}\\
+\bar z_{h+1} &\sim p_\theta(z \mid \bar h_{h+1}), \label{eq:prior_dream}\\
+\hat r_{h+1} &= d_r(\bar h_{h+1}, \bar z_{h+1}), \qquad \hat\gamma_{h+1} = d_\gamma(\bar h_{h+1}, \bar z_{h+1}). \label{eq:scalars_dream}
+\end{align}
+
+\textbf{Policy evaluation on dreams.}
+With TD($\lambda$) returns, the critic and actor losses are
+\begin{align}
+G_h &= \hat r_{h+1} + \hat\gamma_{h+1}\Big[(1-\lambda)\,V_\theta(\bar h_{h+1},\bar z_{h+1}) + \lambda\,G_{h+1}\Big], \\
+L_V &= \tfrac12\big(V_\theta(\bar h_h,\bar z_h) - G_h\big)^2, \qquad
+L_\pi \;=\; -\,\mathbb{E}_{\bar a_h\sim\pi}\left[G_h + \alpha\,\mathcal{H}\!\left(\pi_\theta(\cdot\mid\bar h_h,\bar z_h)\right)\right].
+\end{align}
+ArkAngel heads remain inactive during imagination, ensuring that the hallmark efficiency of Dreamer is preserved.
+
+\section*{4.\quad Inference (Deployment) and Clarifications of Conditioning}
+
+During real--time control in the environment the encoder is active and the posterior is used. The loop for a single control cycle is
+\begin{align}
+e_t=\phi(o_t), \quad h_t=f(h_{t-1},z_{t-1},a_{t-1}), \quad z_t\sim q(z_t\mid h_t,e_t), \quad a_t\sim \pi(h_t,z_t),
+\end{align}
+followed by the environmental transition to $(o_{t+1},r_{t+1})$, then $h_{t+1}=f(h_t,z_t,a_t)$ and $z_{t+1}\sim q(z_{t+1}\mid h_{t+1},e_{t+1})$ with $e_{t+1}=\phi(o_{t+1})$. The posterior never conditions explicitly on $z_t$; its influence is mediated through $h_{t+1}$, thereby matching the ELBO factorization and avoiding leakage. In imagined rollouts the encoder never appears; instead $z_{h+1}$ is sampled from the prior $p(z\mid \bar h_{h+1})$ after the core has advanced $\bar h$ using the previous $(\bar h_h,\bar z_h,\bar a_h)$.
+
+\section*{5.\quad ArkAngel Inference for Partial FOV: Pixel vs.\ Latent Patching}
+
+In deployment under partial observability, ArkAngel runs \emph{every control cycle}. At step $t{-}1$ it predicts the \emph{next} state via LA and, conditioned on that, the \emph{next} pixels via RA. At step $t$, if the incoming frame is masked, ArkAngel patches either the input image (RA inpainting) or the latent state (LA substitution) before acting. This produces a rolling scheme that remains aligned with the one-step training targets while avoiding multi-step compounding error. If the camera is unavailable for multiple consecutive steps, a bounded $K$-step fallback is allowed, driven by the Dreamer prior.
+
+\subsection*{5.1\quad Pixel reconstruction patch (RA inpainting, per-step)}
+Let $M_t\in\{0,1\}^{H\times W}$ be the binary visibility mask for time $t$. At the end of step $t{-}1$, compute the one-step ArkAngel forecasts:
+\begin{align}
+[\hat h_{t}^{\mathrm{LA}},\hat z_{t}^{\mathrm{LA}}] &= g_{\mathrm{LA}}\big([h_{t-1},z_{t-1},a_{t-1}]\big), \\
+\hat o_{t}^{\mathrm{RA}} &= g_{\mathrm{RA}}\big(\hat h_{t}^{\mathrm{LA}},\hat z_{t}^{\mathrm{LA}}\big).
+\end{align}
+At step $t$, form a completed image by inpainting the occluded region,
+\begin{align}
+\tilde o_t \;=\; M_t \odot o_t \;+\; (1-M_t)\odot \hat o_{t}^{\mathrm{RA}},
+\end{align}
+then run the standard posterior update and policy:
+\begin{align}
+e_t=\phi(\tilde o_t),\qquad h_t=f(h_{t-1},z_{t-1},a_{t-1}),\qquad z_t\sim q(z_t\mid h_t,e_t),\qquad a_t\sim\pi(h_t,z_t).
+\end{align}
+This preserves the posterior contract $q(z_t\mid h_t,e_t)$ while allowing test-time inpainting. If a full blackout persists for $K>1$ steps, iterate
+\[
+\hat h_{t+k}^{\mathrm{LA}},\hat z_{t+k}^{\mathrm{LA}} \leftarrow g_{\mathrm{LA}}([\hat h_{t+k-1}^{\mathrm{LA}},\hat z_{t+k-1}^{\mathrm{LA}}, a_{t+k-1}]),
+\quad
+\hat o_{t+k}^{\mathrm{RA}} \leftarrow g_{\mathrm{RA}}(\hat h_{t+k}^{\mathrm{LA}},\hat z_{t+k}^{\mathrm{LA}})
+\]
+with $a_{t+k-1}\sim\pi(\hat h_{t+k-1}^{\mathrm{LA}},\hat z_{t+k-1}^{\mathrm{LA}})$ for at most $K$ steps, then resume posterior updates once pixels return.
+
+\subsection*{5.2\quad Latent reconstruction patch (LA substitution, per-step)}
+At step $t$, compute the LA prediction exactly as above and also the nominal posterior pair $(h_t,z_t)$ from the (possibly masked) input. Using a reliability gate $m_t\in\{0,1\}$ derived from mask coverage or an uncertainty heuristic, form
+\begin{align}
+\tilde h_t \;=\; m_t\,h_t \;+\; (1-m_t)\,\hat h_{t}^{\mathrm{LA}}, \qquad
+\tilde z_t \;=\; m_t\,z_t \;+\; (1-m_t)\,\hat z_{t}^{\mathrm{LA}},
+\end{align}
+and act from $(\tilde h_t,\tilde z_t)$. Under a multi-step blackout, iterate the LA rollout for at most $K$ steps as in Sec.\,5.1 and act from $(\hat h_{t+k}^{\mathrm{LA}},\hat z_{t+k}^{\mathrm{LA}})$ until pixels resume. Compared to RA, LA avoids re-encoding inpainted images and can reduce latency when the masked area is large.
+
+\section*{6.\quad Block--Level Flow Diagrams (Textual)}
+
+For completeness the dataflow is summarized in compact textual diagrams that can be mirrored one--for--one in code.
+
+\textbf{Observation step (with ArkAngel heads active)}
+\[
+\begin{array}{l}
+o_t \xrightarrow{\ \phi\ } e_t, \qquad (h_{t-1},z_{t-1},a_{t-1}) \xrightarrow{\ f\ } h_t, \qquad (h_t,e_t) \xrightarrow{\ q\ } z_t, \\
+(h_t,z_t) \xrightarrow{d_o,d_r,d_\gamma} (\hat o_t,\hat r_t,\hat\gamma_t), \qquad
+[h_t,z_t,a_t] \xrightarrow{\ g_{\mathrm{LA}}\ } [\hat h_{t+1}^{\mathrm{LA}},\hat z_{t+1}^{\mathrm{LA}}]
+\xrightarrow{\ g_{\mathrm{RA}}\ } \hat o_{t+1}^{\mathrm{RA}}.
+\end{array}
+\]
+
+\textbf{Imagination step (encoder--free; ArkAngel heads inactive)}
+\[
+(\bar h_h,\bar z_h) \xrightarrow{\ \pi\ } \bar a_h,\qquad
+(\bar h_h,\bar z_h,\bar a_h) \xrightarrow{\ f\ } \bar h_{h+1},\qquad
+\bar h_{h+1} \xrightarrow{\ p\ } \bar z_{h+1},\qquad
+(\bar h_{h+1},\bar z_{h+1}) \xrightarrow{d_r,d_\gamma} (\hat r_{h+1},\hat\gamma_{h+1}).
+\]
+
+\textbf{Inference with pixel patching}
+\[
+\hat o_{t}^{\mathrm{RA}} \ \text{from LA/RA at } t{-}1,\quad
+\tilde o_t = M_t\odot o_t + (1-M_t)\odot \hat o_{t}^{\mathrm{RA}},\quad
+e_t=\phi(\tilde o_t),\ h_t=f(\cdot),\ z_t\sim q(\cdot),\ a_t\sim \pi(\cdot).
+\]
+
+\textbf{Inference with latent patching}
+\[
+[h_t,z_t] \ \text{from posterior on partial } o_t,\quad
+[\hat h_t^{\mathrm{LA}},\hat z_t^{\mathrm{LA}}] \ \text{from LA},\quad
+[\tilde h_t,\tilde z_t] \ \text{via gate},\quad
+a_t\sim\pi(\tilde h_t,\tilde z_t).
+\]
+
+\section*{7.\quad CarDreamer Evaluation Protocol}
+
+The CarDreamer repository provides driving tasks and observability regimes (full FOV, masked FOV). The baseline reproduction is obtained by training Dreamer\,V3 with the repository defaults and reporting the standard task metrics (success, route completion, infractions). The ArkAngel model is trained by augmenting the observation loss with (\ref{eq:la_loss}) and (\ref{eq:ra_loss}) as per (\ref{eq:phase1}), leaving the imagination loop and actor--critic losses unchanged. After convergence on full--FOV, the FOV patching experiments proceed without any further gradient updates. In the pixel reconstruction condition, the RA head supplies $\hat o_{t}^{\mathrm{RA}}$ to inpaint masked regions before encoding. In the latent reconstruction condition, the LA prediction substitutes $(h_t,z_t)$ according to a reliability gate. Both conditions are evaluated across the same scenarios and masks as the repository, allowing a direct comparison of the two patching strategies and with the unpatched partial--FOV baseline and the full--FOV upper bound. The primary scientific question is whether dynamics--consistent inpainting (via $\hat o_{t}^{\mathrm{RA}}$) or direct belief substitution (via $[\hat h_t^{\mathrm{LA}},\hat z_t^{\mathrm{LA}}]$) achieves higher success and lower infractions under equivalent masking budgets, and whether the relative advantage depends on mask size and topology.
+
+\section*{8.\quad Conceptual Clarifications}
+
+It is essential to emphasize the distinction between observation, imagination, and inference. During observation the encoder $\phi$ is indispensable and the posterior $q(z_t\mid h_t,e_t)$ is the correct conditional; during imagination there is no encoder and $z_{h+1}$ is drawn from the prior $p(z\mid \bar h_{h+1})$ after the core has advanced $\bar h$ using the previous $(\bar h_h,\bar z_h,\bar a_h)$; during inference the encoder is again active and the posterior is used at every real step. The apparent role of $z_t$ in producing $z_{t+1}$ is exclusively through its influence on $h_{t+1}=f(h_t,z_t,a_t)$; the posterior at the next step conditions on $(h_{t+1},e_{t+1})$ and does not accept $z_t$ as an explicit argument. ArkAngel does not alter these contracts; it supplies auxiliary supervision that makes $(h_t,z_t)$ more predictive of $(h_{t+1},z_{t+1})$ and of $o_{t+1}$ while preserving the ELBO structure and the low computational cost of latent--only imagination.
+
+\end{document}
+

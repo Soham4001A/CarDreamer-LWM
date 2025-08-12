@@ -35,8 +35,22 @@ class Agent(nj.Module):
             self.expl_behavior = getattr(behaviors, config.expl_behavior)(self.wm, self.act_space, self.config, name="expl_behavior")
 
     def policy_initial(self, batch_size):
+        wm_initial, prev_action = self.wm.initial(batch_size)
+        arkangel_pred = {}
+        if self.config.arkangel.enable:
+            h_hat = jnp.zeros_like(wm_initial['deter'])
+            z_hat = jnp.zeros_like(wm_initial['stoch'])
+            arkangel_pred['h_hat'] = h_hat
+            arkangel_pred['z_hat'] = z_hat
+            if hasattr(self.wm, 'ra_head'):
+                cnn_keys = list(self.wm.encoder.cnn_shapes.keys())
+                recon_key = self.config.arkangel.get('recon_key', cnn_keys[0] if cnn_keys else '')
+                if recon_key:
+                    o_hat = jnp.zeros((batch_size, *self.obs_space[recon_key].shape))
+                    arkangel_pred['o_hat'] = o_hat
+        
         return (
-            self.wm.initial(batch_size),
+            (wm_initial, prev_action, arkangel_pred, jnp.zeros(batch_size, dtype=jnp.int32)),
             self.task_behavior.initial(batch_size),
             self.expl_behavior.initial(batch_size),
         )
@@ -47,9 +61,39 @@ class Agent(nj.Module):
     def policy(self, obs, state, mode="train"):
         self.config.jax.jit and print("Tracing policy function.")
         obs = self.preprocess(obs)
-        (prev_latent, prev_action), task_state, expl_state = state
-        embed = self.wm.encoder(obs)
-        latent, _ = self.wm.rssm.obs_step(prev_latent, prev_action, embed, obs["is_first"])
+        (prev_latent, prev_action, prev_arkangel_pred, blackout_counter), task_state, expl_state = state
+
+        # Determine if we should use the prediction
+        is_blackout = ('mask_fov' in obs) and (obs['mask_fov'].mean() == 0.0)
+        use_prediction = is_blackout and (blackout_counter[0] < self.config.arkangel.patch_k) and (self.config.arkangel.patch in ('pixel', 'latent')) and (mode != 'train')
+
+        if use_prediction:
+            blackout_counter = blackout_counter + 1
+            latent = {'deter': prev_arkangel_pred['h_hat'], 'stoch': prev_arkangel_pred['z_hat']}
+        else:
+            blackout_counter = jnp.zeros_like(blackout_counter)
+            
+            # Single-step patching
+            if self.config.arkangel.enable and self.config.arkangel.patch == 'pixel' and mode != 'train':
+                if 'mask_fov' in obs and 'o_hat' in prev_arkangel_pred:
+                    mask = obs['mask_fov']
+                    o_hat = prev_arkangel_pred['o_hat']
+                    cnn_keys = list(self.wm.encoder.cnn_shapes.keys())
+                    recon_key = self.config.arkangel.get('recon_key', cnn_keys[0] if cnn_keys else '')
+                    if recon_key:
+                        obs[recon_key] = mask * obs[recon_key] + (1 - mask) * o_hat
+            
+            embed = self.wm.encoder(obs)
+            latent, _ = self.wm.rssm.obs_step(prev_latent, prev_action, embed, obs["is_first"])
+
+            if self.config.arkangel.enable and self.config.arkangel.patch == 'latent' and mode != 'train':
+                if 'mask_fov' in obs and 'h_hat' in prev_arkangel_pred:
+                    h_hat, z_hat = prev_arkangel_pred['h_hat'], prev_arkangel_pred['z_hat']
+                    m_t = (obs['mask_fov'].mean(axis=(-3, -2, -1)) > self.config.arkangel.gate.min_coverage).astype(jnp.float32)
+                    m_t = m_t.reshape(m_t.shape + (1,))
+                    latent['deter'] = m_t * latent['deter'] + (1 - m_t) * h_hat
+                    latent['stoch'] = m_t * latent['stoch'] + (1 - m_t) * z_hat
+
         self.expl_behavior.policy(latent, expl_state)
         task_outs, task_state = self.task_behavior.policy(latent, task_state)
         expl_outs, expl_state = self.expl_behavior.policy(latent, expl_state)
@@ -65,7 +109,17 @@ class Agent(nj.Module):
             outs = task_outs
             outs["log_entropy"] = outs["action"].entropy()
             outs["action"] = outs["action"].sample(seed=nj.rng())
-        state = ((latent, outs["action"]), task_state, expl_state)
+
+        arkangel_pred = {}
+        if self.config.arkangel.enable:
+            h_hat_tp1, z_hat_tp1 = self.wm.la_head(latent['deter'], latent['stoch'], outs['action'])
+            arkangel_pred['h_hat'] = h_hat_tp1
+            arkangel_pred['z_hat'] = z_hat_tp1
+            if hasattr(self.wm, 'ra_head'):
+                o_hat_tp1_dist = self.wm.ra_head(h_hat_tp1, z_hat_tp1)
+                arkangel_pred['o_hat'] = o_hat_tp1_dist.mode()
+
+        state = ((latent, outs["action"], arkangel_pred, blackout_counter), task_state, expl_state)
         return outs, state
 
     def train(self, data, state):
@@ -139,11 +193,31 @@ class WorldModel(nj.Module):
             "reward": nets.MLP((), **config.reward_head, name="rew"),
             "cont": nets.MLP((), **config.cont_head, name="cont"),
         }
+        if self.config.arkangel.enable:
+            self.la_head = nets.LatentActor(
+                self.rssm._deter,
+                self.rssm._stoch,
+                self.rssm._classes,
+                name="la_head",
+                **self.config.arkangel.la_head
+            )
+            cnn_keys = list(self.encoder.cnn_shapes.keys())
+            recon_key = self.config.arkangel.get('recon_key', cnn_keys[0] if cnn_keys else '')
+            if recon_key:
+                self.ra_head = nets.ReconstructionActor(
+                    self.obs_space[recon_key].shape,
+                    name="ra_head",
+                    **self.config.arkangel.ra_head
+                )
+
         self.opt = jaxutils.Optimizer(name="model_opt", **config.model_opt)
         scales = self.config.loss_scales.copy()
         image, vector = scales.pop("image"), scales.pop("vector")
         scales.update({k: image for k in self.heads["decoder"].cnn_shapes})
         scales.update({k: vector for k in self.heads["decoder"].mlp_shapes})
+        if self.config.arkangel.enable:
+            scales['la'] = self.config.arkangel.lambda_la
+            scales['ra'] = self.config.arkangel.lambda_ra
         self.scales = scales
 
     def initial(self, batch_size):
@@ -153,6 +227,10 @@ class WorldModel(nj.Module):
 
     def train(self, data, state):
         modules = [self.encoder, self.rssm, *self.heads.values()]
+        if self.config.arkangel.enable:
+            modules.append(self.la_head)
+            if hasattr(self, 'ra_head'):
+                modules.append(self.ra_head)
         mets, (state, outs, metrics) = self.opt(modules, self.loss, data, state, has_aux=True)
         metrics.update(mets)
         return state, outs, metrics
@@ -175,7 +253,43 @@ class WorldModel(nj.Module):
             loss = -dist.log_prob(data[key].astype(jnp.float32))
             assert loss.shape == embed.shape[:2], (key, loss.shape)
             losses[key] = loss
-        scaled = {k: v * self.scales[k] for k, v in losses.items()}
+        
+        if self.config.arkangel.enable:
+            h_t = post['deter'][:, :-1]
+            z_t = post['stoch'][:, :-1]
+            a_t = data['action'][:, :-1]
+            h_hat_tp1, z_hat_tp1 = self.la_head(h_t, z_t, a_t)
+
+            h_tp1_target = sg(post['deter'][:, 1:])
+            z_tp1_target = sg(post['stoch'][:, 1:])
+
+            la_loss_h = ((h_hat_tp1 - h_tp1_target) ** 2).mean()
+            if self.rssm._classes:
+                q_logits_tp1 = sg(post['logit'][:, 1:])
+                z_hat_logits = z_hat_tp1
+                q_probs = jax.nn.softmax(q_logits_tp1, axis=-1)
+                p_probs = jax.nn.softmax(z_hat_logits, axis=-1)
+                la_loss_z = (q_probs * (jnp.log(q_probs + 1e-8) - jnp.log(p_probs + 1e-8))).sum(-1).mean()
+            else:
+                la_loss_z = ((z_hat_tp1 - z_tp1_target) ** 2).mean()
+            losses['la'] = la_loss_h + la_loss_z
+
+            if hasattr(self, 'ra_head'):
+                o_hat_tp1_dist = self.ra_head(h_hat_tp1, z_hat_tp1)
+                cnn_keys = list(self.encoder.cnn_shapes.keys())
+                recon_key = self.config.arkangel.get('recon_key', cnn_keys[0] if cnn_keys else '')
+                o_tp1_target = data[recon_key][:, 1:]
+                ra_loss = -o_hat_tp1_dist.log_prob(o_tp1_target)
+                if self.config.arkangel.lpips_weight > 0:
+                    # This is a placeholder for LPIPS loss.
+                    # A real LPIPS implementation would require a pre-trained network.
+                    # For now, we use MSE as a placeholder.
+                    o_hat_tp1 = o_hat_tp1_dist.mode()
+                    lpips_loss = ((o_hat_tp1 - o_tp1_target) ** 2).mean()
+                    ra_loss += self.config.arkangel.lpips_weight * lpips_loss
+                losses['ra'] = ra_loss.mean()
+
+        scaled = {k: v * self.scales.get(k, 1.0) for k, v in losses.items()}
         model_loss = sum(scaled.values())
         out = {"embed": embed, "post": post, "prior": prior}
         out.update({f"{k}_loss": v for k, v in losses.items()})

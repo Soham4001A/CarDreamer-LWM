@@ -329,6 +329,68 @@ class MultiDecoder(nj.Module):
         raise NotImplementedError(self._image_dist)
 
 
+
+class LatentActor(nj.Module):
+    def __init__(self, deter_size, stoch_size, classes, mlp_layers=4, mlp_units=512, **kw):
+        self._deter_size = deter_size
+        self._stoch_size = stoch_size
+        self._classes = classes
+        self._kw = kw
+        if self._classes:
+            self._shape = (self._deter_size + self._stoch_size * self._classes,)
+        else:
+            self._shape = (self._deter_size + self._stoch_size,)
+
+        self._mlp = MLP(
+            shape=self._shape,
+            layers=mlp_layers,
+            units=mlp_units,
+            name="la_mlp",
+            **self._kw
+        )
+
+    def __call__(self, h, z, a):
+        if self._classes:
+            z = z.reshape(z.shape[:-2] + (self._stoch_size * self._classes,))
+        
+        if len(a.shape) > len(h.shape):
+            shape = a.shape[:-2] + (np.prod(a.shape[-2:]),)
+            a = a.reshape(shape)
+
+        x = jnp.concatenate([h, z, a], -1)
+        x = self._mlp(x)
+        
+        if self._classes:
+            h_hat, z_hat_logit = jnp.split(x, [self._deter_size], -1)
+            z_hat = z_hat_logit.reshape(z_hat_logit.shape[:-1] + (self._stoch_size, self._classes))
+            return h_hat, z_hat
+        else:
+            h_hat, z_hat = jnp.split(x, [self._deter_size], -1)
+            return h_hat, z_hat
+
+class ReconstructionActor(nj.Module):
+    def __init__(self, shape, cnn_depth=48, cnn_blocks=2, resize='stride', minres=4, cnn_sigmoid=False, image_dist='mse', **kw):
+        self._shape = shape
+        self._image_dist = image_dist
+        self._kw = {**kw, 'name': 'ra_cnn'}
+        self._decoder = ImageDecoderResnet(shape, cnn_depth, cnn_blocks, resize, minres=minres, sigmoid=cnn_sigmoid, **self._kw)
+
+    def __call__(self, h_hat, z_hat):
+        if len(z_hat.shape) > 2: # classes
+            z_hat = z_hat.reshape(z_hat.shape[:-2] + (z_hat.shape[-2] * z_hat.shape[-1],))
+        x = jnp.concatenate([h_hat, z_hat], -1)
+        mean = self._decoder(x)
+        return self._make_image_dist(mean)
+
+    def _make_image_dist(self, mean):
+        mean = mean.astype(f32)
+        if self._image_dist == "normal":
+            return tfd.Independent(tfd.Normal(mean, 1), 3)
+        if self._image_dist == "mse":
+            return jaxutils.MSEDist(mean, 3, "sum")
+        raise NotImplementedError(self._image_dist)
+
+
 class ImageEncoderResnet(nj.Module):
     def __init__(self, depth, blocks, resize, minres, **kw):
         self._depth = depth

@@ -1,0 +1,123 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ArkAngel × DreamerV3 in CarDreamer — Repo-Specific Implementation Notes
+% (Instructions + checklist only; no shell script in this file.)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsfonts,booktabs,geometry,hyperref}
+\geometry{margin=1in}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\sg}{\operatorname{stop\_grad}}
+
+\begin{document}
+{\LARGE \textbf{ArkAngel Integration in CarDreamer}}
+
+\section*{A.\quad Where to add code}
+\paragraph{Model heads.}
+Add two modules to the Dreamer\,V3 world model in \code{CarDreamer/dreamerv3/}:
+\[
+g_{\mathrm{LA}}:\ [h_t,z_t,a_t]\ \mapsto\ [\hat h_{t+1}^{\mathrm{LA}},\hat z_{t+1}^{\mathrm{LA}}],\qquad
+g_{\mathrm{RA}}:\ [\hat h_{t+1}^{\mathrm{LA}},\hat z_{t+1}^{\mathrm{LA}}]\ \mapsto\ \hat o_{t+1}^{\mathrm{RA}}.
+\]
+Define them near the existing decoders so they can reuse channel widths and initialization. Export both from the world-model class so the learner (for losses) and the actor/evaluator (for test-time patching) can access them. CarDreamer trains Dreamer\,V3 via \code{train\_dm3.sh}; configuration is passed by YAML overrides at the CLI.
+
+\paragraph{Training losses (real steps only).}
+In the learner where the Dreamer world-model objective \(L_{\mathrm{wm}}\) is computed, augment it with ArkAngel auxiliary losses using consecutive replay transitions \((t,t{+}1)\):
+\[
+L_{\mathrm{Phase1}} \;=\; L_{\mathrm{wm}} \;+\; \lambda_{\mathrm{LA}}\,L_{\mathrm{LA}} \;+\; \lambda_{\mathrm{RA}}\,L_{\mathrm{RA}},
+\]
+with
+\[
+L_{\mathrm{LA}}=\big\| \sg(h_{t+1})-\hat h_{t+1}^{\mathrm{LA}}\big\|_2^2+\big\|\sg(z_{t+1})-\hat z_{t+1}^{\mathrm{LA}}\big\|_2^2,\quad
+L_{\mathrm{RA}}=\|o_{t+1}-\hat o_{t+1}^{\mathrm{RA}}\|_2^2+\beta_{\mathrm{LPIPS}}\mathrm{LPIPS}(o_{t+1},\hat o_{t+1}^{\mathrm{RA}}).
+\]
+Do \emph{not} change the Dreamer imagination loop: no encoder, no ArkAngel heads in dreams. This preserves Dreamer\,V3’s efficiency and stability.
+
+\paragraph{Inference patching (evaluation/acting path).}
+Insert a pre-encode hook that runs every control cycle:
+\begin{enumerate}
+\item At the end of step \(t{-}1\), cache ArkAngel forecasts
+\(
+[\hat h_t^{\mathrm{LA}},\hat z_t^{\mathrm{LA}}]=g_{\mathrm{LA}}([h_{t-1},z_{t-1},a_{t-1}])
+\)
+and
+\(
+\hat o_t^{\mathrm{RA}}=g_{\mathrm{RA}}(\hat h_t^{\mathrm{LA}},\hat z_t^{\mathrm{LA}}).
+\)
+\item When the next frame \(o_t\) arrives:
+\begin{itemize}
+\item If \code{--dreamerv3.arkangel.patch=pixel} (RA inpainting), form \(\tilde o_t=M_t\odot o_t+(1-M_t)\odot \hat o_t^{\mathrm{RA}}\) and feed \(\tilde o_t\) to the encoder \(\phi\).
+\item If \code{--dreamerv3.arkangel.patch=latent} (LA substitution), compute the nominal posterior \((h_t,z_t)\) from \(o_t\), then form \(\tilde h_t=m_t h_t+(1-m_t)\hat h_t^{\mathrm{LA}}\) and \(\tilde z_t=m_t z_t+(1-m_t)\hat z_t^{\mathrm{LA}}\), where \(m_t\in\{0,1\}\) or \(m_t\in[0,1]\) is a reliability gate from mask coverage or encoder-uncertainty. Pass \((\tilde h_t,\tilde z_t)\) to the policy.
+\end{itemize}
+\item Continue with the normal actor and environment step.
+\end{enumerate}
+If a blackout persists for \(K>0\) steps, roll LA/RA forward for at most \(K\) steps and act from the predicted state, then revert to the posterior path once pixels resume.
+
+\section*{B.\quad Getting the mask \(M_t\) inside CarDreamer}
+CarDreamer exposes observability through its Bird’s-Eye-View (BEV) handler(s). In \code{common.yaml} or per-task configs, the BEV key (typically \code{birdeye\_view}) accepts \(\texttt{observability}\in\{\texttt{full},\texttt{fov},\texttt{recursive\_fov}\}\); FOV lines can be rendered as entities. Two practical options exist:
+\begin{enumerate}
+\item \textbf{Direct mask handler.} Implement a small handler that emits \(\texttt{mask\_fov}\) aligned to the image being patched (camera or BEV). Compute it from the handler’s \(\texttt{sight\_fov}\), \(\texttt{sight\_range}\), and ego pose provided by the environment/observer. Enable it via \(\texttt{env.observation.enabled}\) and read it in the actor loop.
+\item \textbf{Fast BEV mask.} If patching BEV images, infer \(M_t\) from the already-rendered FOV geometry (e.g., rasterize \(\texttt{fov\_lines}\) into a binary mask) or keep a second, full-BEV render during evaluation only to derive visibility. The direct handler is preferable for speed and exact alignment.
+\end{enumerate}
+
+\section*{C.\quad Config flags to add (YAML schema)}
+Extend the Dreamer\,V3 config so runs can be toggled from the CLI:
+\begin{verbatim}
+dreamerv3.arkangel.enable: true|false
+dreamerv3.arkangel.lambda_la: 1.0
+dreamerv3.arkangel.lambda_ra: 0.5
+dreamerv3.arkangel.lpips_weight: 0.5
+dreamerv3.arkangel.patch: none|pixel|latent
+dreamerv3.arkangel.patch_k: 0            # 0 = no multi-step blackout fallback
+dreamerv3.arkangel.gate.min_coverage: 0.6 # mean(M_t) threshold for latent patch
+\end{verbatim}
+These keys may be overridden on the command line, e.g.
+\(
+\cdots\ \texttt{--dreamerv3.arkangel.enable=true\ --dreamerv3.arkangel.patch=pixel}.
+\)
+
+\section*{D.\quad Training policy (first sweep)}
+Train exactly as the baseline (no masking or augmentation in training), but with ArkAngel losses enabled when desired. This yields clean ablations:
+\[
+\text{Baseline}:\ \lambda_{\mathrm{LA}}=\lambda_{\mathrm{RA}}=0;\qquad
+\text{ArkAngel (no patch)}:\ \lambda_{\mathrm{LA}}>0,\ \lambda_{\mathrm{RA}}>0,\ \texttt{patch=none}.
+\]
+A mixed-patch curriculum (random masks applied to real frames solely for the RA loss target) can be explored later but should be disabled for the initial reproduction.
+
+\section*{E.\quad Minimal checklist for the code changes}
+\begin{enumerate}
+\item Add \(\,g_{\mathrm{LA}},g_{\mathrm{RA}}\,\) modules to the Dreamer\,V3 world model; export them.
+\item In the learner, compute \(L_{\mathrm{LA}},L_{\mathrm{RA}}\) from replay transitions and accumulate \(L_{\mathrm{Phase1}}\).
+\item Add CLI/YAML flags under \(\texttt{dreamerv3.arkangel.*}\); plumb them into model construction and loss weights.
+\item In the actor/evaluator, insert the pre-encode hook implementing \(\texttt{patch=pixel}\) or \(\texttt{patch=latent}\) using cached LA/RA forecasts; maintain a small ring buffer for \([\hat h,\hat z,\hat o]\).
+\item Provide a mask \(M_t\) via a handler or BEV rasterization; validate its alignment numerically (IoU against rendered FOV region).
+\item Verify that imagination remains encoder-free; ArkAngel heads are inactive in dreams.
+\end{enumerate}
+
+\section*{F.\quad Intention Sharing: configuration and sweep policy}
+To replicate the repository’s studies, sweep the BEV \emph{intention sharing} levels across all tasks and observability modes. Intention sharing is controlled by the BEV entities and the waypoint-visibility policy:
+\[
+\texttt{env.observation.<birdeye\_key>.entities}\quad\text{and}\quad
+\texttt{env.observation.<birdeye\_key>.waypoint\_obs}\in\{\texttt{neighbor},\texttt{visible},\texttt{all}\}.
+\]
+Define four levels for experiments:
+\[
+\begin{array}{ll}
+\textbf{none:} & \text{exclude } \texttt{background\_waypoints} \text{ (and } \texttt{messages} \text{)} \Rightarrow \text{no intention sharing};\\
+\textbf{neighbor/visible/all:} & \text{include } \texttt{background\_waypoints} \text{ in } \texttt{entities};\ \text{set } \texttt{waypoint\_obs} \text{ accordingly}.
+\end{array}
+\]
+If the repository exposes transmission-error controls for shared intentions, sweep a small grid by overriding the corresponding YAML key at run time; otherwise omit. Ensure that BEV is enabled in \(\texttt{env.observation.enabled}\) when running these sweeps.
+
+\section*{G.\quad Runtime modes and evaluation semantics}
+Runs are organized into four mutually exclusive \emph{modes}:
+\[
+\begin{array}{ll}
+\textbf{baseline}: & \texttt{arkangel.enable=false},\ \texttt{arkangel.patch=none}; \\[2pt]
+\textbf{arkangel}: & \texttt{arkangel.enable=true},\ \texttt{arkangel.patch=none}; \\[2pt]
+\textbf{patch-ra}: & \texttt{arkangel.enable=true},\ \texttt{arkangel.patch=pixel}; \\[2pt]
+\textbf{patch-la}: & \texttt{arkangel.enable=true},\ \texttt{arkangel.patch=latent}. \\
+\end{array}
+\]
+Evaluation is run for every mode; in \(\textbf{patch-ra}\) and \(\textbf{patch-la}\) the pre-encode hook performs per-step patching as specified in Section~A. For reproducibility, keep seeds explicit and log under directories that encode \(\{\text{mode},\text{task},\text{observability},\text{intent},\text{seed}\}\).
+
+\end{document}
