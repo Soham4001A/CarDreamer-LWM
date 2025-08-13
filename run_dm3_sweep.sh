@@ -17,7 +17,8 @@ if [ -z "${CARLA_ROOT:-}" ] || [ ! -x "$CARLA_ROOT/CarlaUE4.sh" ]; then
 fi
 
 # Tasks to sweep over
-TASKS=("carla_four_lane" "carla_right_turn_hard" "carla_left_turn_hard" "carla_roundabout" "carla_lane_merge")
+# TASKS=("carla_four_lane" "carla_right_turn_hard" "carla_left_turn_hard" "carla_roundabout" "carla_lane_merge")
+TASKS=("carla_four_lane")
 
 # BEV streams to sweep over
 BEV_STREAMS=("birdeye_raw" "birdeye_wpt" "birdeye_gt")
@@ -26,13 +27,15 @@ BEV_STREAMS=("birdeye_raw" "birdeye_wpt" "birdeye_gt")
 OBSERVABILITY_MODES=("full" "fov" "recursive_fov")
 
 # Intention sharing levels
-INTENTION_LEVELS=("none" "neighbor" "visible" "all")
+# INTENTION_LEVELS=("none" "neighbor" "visible" "all")
+INTENTION_LEVELS=("none")
 
 # ArkAngel modes
 ARKANGEL_MODES=("baseline" "arkangel" "patch-ra" "patch-la")
 
 # Transmission error rates
-ERROR_RATES=(0.0 0.2 0.5)
+# ERROR_RATES=(0.0 0.2 0.5)
+ERROR_RATES=(0.0)
 
 for task in "${TASKS[@]}"; do
   for bev_stream in "${BEV_STREAMS[@]}"; do
