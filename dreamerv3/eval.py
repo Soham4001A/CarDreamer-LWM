@@ -123,6 +123,7 @@ def main(argv=None):
         step,
         [
             embodied.logger.TerminalOutput(),
+            embodied.logger.WandBOutput(logdir.name, config),
             embodied.logger.JSONLOutput(logdir, "metrics.jsonl"),
             embodied.logger.TensorBoardOutput(logdir),
         ],
