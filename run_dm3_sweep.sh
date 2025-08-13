@@ -9,6 +9,13 @@ SMOKE=${5:-false}
 SMOKE_STEPS=${6:-100}
 LOG_ROOT="./logdir/sweep_$(date +%Y%m%d_%H%M%S)"
 
+# Verify CARLA is available before sweeping
+if [ -z "${CARLA_ROOT:-}" ] || [ ! -x "$CARLA_ROOT/CarlaUE4.sh" ]; then
+  echo "ERROR: CARLA_ROOT is not set or CarlaUE4.sh not found at: '$CARLA_ROOT'" >&2
+  echo "Please set CARLA_ROOT to your CARLA folder, e.g.: export CARLA_ROOT=\"$HOME/CARLA_0.9.15\"" >&2
+  exit 1
+fi
+
 # Tasks to sweep over
 TASKS=("carla_four_lane" "carla_right_turn_hard" "carla_left_turn_hard" "carla_roundabout" "carla_lane_merge")
 
