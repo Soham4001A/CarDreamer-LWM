@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Usage: ./run_dm3_sweep.sh <carla_port> <gpu_id> [dry_run] [run_eval]
 
 CARLA_PORT=${1:-2000}
@@ -35,6 +34,7 @@ for task in "${TASKS[@]}"; do
 
             LOGDIR="${LOG_ROOT}/${task}/${bev_stream}/${observability}/${intent_level}/${arkangel_mode}/error_${error_rate}"
             echo "Running experiment: ${LOGDIR}"
+            mkdir -p "${LOGDIR}"
 
             # Base command
             CMD="bash train_dm3.sh ${CARLA_PORT} ${GPU} --task ${task} --dreamerv3.logdir ${LOGDIR}"
@@ -46,16 +46,16 @@ for task in "${TASKS[@]}"; do
 
             # Intention sharing settings
             if [[ "${intent_level}" != "none" ]]; then
-                if [[ "${error_rate}" != "0.0" && "${error_rate}" != "0" ]]; then
-                    CMD="${CMD} --env.observation.${bev_stream}.entities='[roadmap,waypoints,error_background_waypoints,ego_vehicle,background_vehicles]'"
-                    CMD="${CMD} --env.observation.${bev_stream}.error_rate=${error_rate}"
-                else
-                    CMD="${CMD} --env.observation.${bev_stream}.entities='[roadmap,waypoints,background_waypoints,ego_vehicle,background_vehicles]'"
-                fi
-                CMD="${CMD} --env.observation.${bev_stream}.waypoint_obs=${intent_level}"
+              if [[ "${error_rate}" != "0.0" && "${error_rate}" != "0" ]]; then
+                CMD="${CMD} --env.observation.${bev_stream}.entities='[roadmap,waypoints,error_background_waypoints,ego_vehicle,background_vehicles]'"
+                CMD="${CMD} --env.observation.${bev_stream}.error_rate=${error_rate}"
+              else
+                CMD="${CMD} --env.observation.${bev_stream}.entities='[roadmap,waypoints,background_waypoints,ego_vehicle,background_vehicles]'"
+              fi
+              CMD="${CMD} --env.observation.${bev_stream}.waypoint_obs=${intent_level}"
             fi
 
-            # ArkAngel settings
+            # ArkAngel settings (choose exactly one mode per run)
             case ${arkangel_mode} in
               "baseline")
                 CMD="${CMD} --dreamerv3.arkangel.enable=false --dreamerv3.arkangel.patch=none"
@@ -73,24 +73,23 @@ for task in "${TASKS[@]}"; do
                 ;;
             esac
 
-            # Print the command to be executed
             echo "-----------------------------------------------------------------"
             echo "Command to execute:"
             echo "${CMD}"
             echo "-----------------------------------------------------------------"
 
             if [ "${DRY_RUN}" = false ]; then
-                eval ${CMD}
-                if [ "${RUN_EVAL}" = true ]; then
-                    CKPT=$(ls -t "${LOGDIR}"/checkpoint* 2>/dev/null | head -n1)
-                    if [ -n "${CKPT}" ]; then
-                        EVAL_CMD="bash eval_dm3.sh ${CARLA_PORT} ${GPU} ${CKPT} --task ${task} --dreamerv3.logdir ${LOGDIR}/eval"
-                        echo "Running evaluation: ${EVAL_CMD}"
-                        eval ${EVAL_CMD}
-                    else
-                        echo "No checkpoint found for evaluation in ${LOGDIR}"
-                    fi
+              eval ${CMD}
+              if [ "${RUN_EVAL}" = true ]; then
+                CKPT=$(ls -t "${LOGDIR}"/checkpoint* 2>/dev/null | head -n1)
+                if [ -n "${CKPT}" ]; then
+                  EVAL_CMD="bash eval_dm3.sh ${CARLA_PORT} ${GPU} ${CKPT} --task ${task} --dreamerv3.logdir ${LOGDIR}/eval"
+                  echo "Running evaluation: ${EVAL_CMD}"
+                  eval ${EVAL_CMD}
+                else
+                  echo "No checkpoint found for evaluation in ${LOGDIR}"
                 fi
+              fi
             fi
 
           done
